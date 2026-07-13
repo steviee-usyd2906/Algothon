@@ -78,6 +78,18 @@ MIN_REV_HISTORY = REV_LOOKBACK + 5
 
 MOM_WEIGHT = 0.6
 REV_WEIGHT = 0.4
+RESID_WEIGHT = 0.55
+RIDGE_WEIGHT = 0.15
+
+RESID_LOOKBACK = 5
+RESID_BETA_LOOKBACK = 80
+RIDGE_MAX_TRAIN_DAYS = 180
+RIDGE_MIN_TRAIN_DAYS = 70
+RIDGE_ALPHA = 25.0
+
+ADAPTIVE_IC_LOOKBACK = 60
+ADAPTIVE_IC_MIN_DAYS = 25
+ADAPTIVE_PRIOR = np.array([0.55, 0.35, 0.45, 0.10])
 
 VOL_HALFLIFE_FAST = 20
 VOL_HALFLIFE_SLOW = 60
@@ -89,6 +101,7 @@ INST0_DLR_POS_LIMIT = 100_000
 
 RISK_FRACTION = 1.0
 TAU = 0.1
+ALPHA_TAU = 1.0
 ALGO_RISK_FRACTION = 1.0
 SIGNAL_KEEP_TOP_K = 20
 
@@ -107,6 +120,16 @@ CVAR_BUDGET_GRID = [3_000.0, 5_000.0, 8_000.0]
 SWEEP_HOLDOUT_DAYS = 100      # never calibrate on the most recent N days
 SWEEP_MIN_TRAIN_DAYS = 60     # need at least this many simulated days to trust a score
 SWEEP_DD_PENALTY = 0.25       # objective = Sharpe - SWEEP_DD_PENALTY * (maxDD / $10k)
+
+# --- short bias on the SIGNAL book (trend + reversion) --------------------
+# Long dollar exposure is scaled by (1 - SHORT_BIAS), short dollar exposure
+# by (1 + SHORT_BIAS), per instrument, BEFORE the Kelly / vol / CVaR overlays
+# so all downstream risk management sees the biased book. Applied identically
+# in the calibration sweep so the swept thresholds match the live book.
+# The pairs overlay is deliberately untouched (it is market-neutral by
+# construction; tilting it would break the hedge). 0.0 disables entirely.
+ENABLE_SHORT_BIAS = True
+SHORT_BIAS = 0.25
 
 # --- PnL-feedback de-risker (hysteretic kill switch, merged from v1) ------
 DERISK_SCALE = 0.5        # 1.0 disables the de-risker entirely
@@ -130,9 +153,9 @@ TARGET_PORTFOLIO_DAILY_VOL = 4000.0
 SMOOTH_ALPHA = 0.35
 MIN_TRADE_DOLLARS = 200.0
 
-# --- pairs-trading overlay (unchanged; deliberately NOT drawdown-managed,
-# per Kaminski & Lo -- this book is mean-reverting by construction) --------
-PAIRS = [
+# --- pairs-trading overlay (deliberately NOT drawdown-managed, per
+# Kaminski & Lo -- this book is mean-reverting by construction) ------------
+DEFAULT_PAIRS = [
     (5, 21, -0.071235),
     (13, 45, 0.597452),
     (49, 50, 0.449571),
@@ -146,11 +169,22 @@ PAIRS = [
     (14, 36, -4.895907),
     (26, 32, 0.604611),
 ]
+PAIR_DISCOVERY_ENABLED = True
+PAIR_DISCOVERY_TOP_K = 10
+PAIR_DISCOVERY_MAX_PAIRS = 18
+PAIR_DISCOVERY_MIN_HISTORY = 160
+PAIR_DISCOVERY_HOLDOUT_DAYS = 40
+PAIR_DISCOVERY_VOL_HALFLIFE = 30
+PAIR_DISCOVERY_RET_LOOKBACK = 20
+PAIR_DISCOVERY_ADF_THRESHOLD = -2.86
 PAIR_Z_LOOKBACK = 60
 PAIR_Z_ENTRY = 2.0
 PAIR_Z_EXIT = 0.5
-PAIR_TRADE_DOLLARS = 1500.0
-PAIR_SIGNAL_GATE = True
+PAIR_TRADE_DOLLARS = 30_000.0
+PAIR_MAX_BOOK_DOLLARS = 420_000.0
+PAIR_TARGET_DAILY_VOL = 6_000.0
+PAIR_MIN_BACKTEST_TRADES = 12
+PAIR_SIGNAL_GATE = False
 
 # --- minimum-activity guarantee -------------------------------------------
 MIN_TOTAL_DVOLUME = 25_000.0
@@ -235,6 +269,182 @@ def _reversion_signal(prcSoFar, vol):
     return -z
 
 
+def _zscore_cross_section(x):
+    x = np.nan_to_num(np.asarray(x, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    return (x - x.mean()) / (x.std() + 1e-9)
+
+
+def _residual_reversion_signal(prcSoFar, vol):
+    """Mean reversion after stripping the common market component.
+
+    Absolute short-horizon reversion is noisy in market-wide selloffs/rallies;
+    this signal trades names that moved too far versus their own market beta.
+    """
+    nInst, T = prcSoFar.shape
+    if T <= max(RESID_LOOKBACK + 1, RESID_BETA_LOOKBACK):
+        return np.zeros(nInst)
+
+    safe_prices = np.maximum(prcSoFar, 1e-12)
+    logp = np.log(safe_prices)
+    ret = np.diff(logp, axis=1)
+    market = ret.mean(axis=0)
+    beta_window = min(RESID_BETA_LOOKBACK, ret.shape[1] - RESID_LOOKBACK)
+    if beta_window < 20:
+        return np.zeros(nInst)
+
+    inst_hist = ret[:, -RESID_LOOKBACK - beta_window:-RESID_LOOKBACK]
+    mkt_hist = market[-RESID_LOOKBACK - beta_window:-RESID_LOOKBACK]
+    mkt_var = float(np.var(mkt_hist))
+    if mkt_var < 1e-12:
+        beta = np.ones(nInst)
+    else:
+        beta = ((inst_hist - inst_hist.mean(axis=1, keepdims=True))
+                @ (mkt_hist - mkt_hist.mean())) / (beta_window * mkt_var)
+        beta = np.clip(beta, -2.0, 3.0)
+
+    inst_move = ret[:, -RESID_LOOKBACK:].sum(axis=1)
+    mkt_move = market[-RESID_LOOKBACK:].sum()
+    residual_move = inst_move - beta * mkt_move
+    residual_vol = np.maximum(vol * np.sqrt(RESID_LOOKBACK), 1e-8)
+    return _zscore_cross_section(-residual_move / residual_vol)
+
+
+def _rank01_to_score(x):
+    """Map a cross-section to roughly [-1, 1] by rank, robust to outliers."""
+    x = np.nan_to_num(np.asarray(x, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    n = x.size
+    if n <= 1 or np.allclose(x, x[0]):
+        return np.zeros(n)
+    order = np.argsort(x)
+    ranks = np.empty(n, dtype=float)
+    ranks[order] = np.arange(n, dtype=float)
+    return 2.0 * (ranks / max(1.0, n - 1.0)) - 1.0
+
+
+def _ridge_feature_matrix(logp, day_indices):
+    """Panel features for a lightweight pooled ridge next-return ranker."""
+    feats = []
+    for d in day_indices:
+        r1 = logp[:, d] - logp[:, d - 1]
+        r5 = logp[:, d] - logp[:, d - 5]
+        r20 = logp[:, d] - logp[:, d - 20]
+        r60 = logp[:, d] - logp[:, d - 60]
+        ret20 = np.diff(logp[:, d - 20:d + 1], axis=1)
+        ret60 = np.diff(logp[:, d - 60:d + 1], axis=1)
+        vol20 = ret20.std(axis=1)
+        vol60 = ret60.std(axis=1)
+        market5 = r5.mean()
+        resid5 = r5 - market5
+        day_feat = np.column_stack([r1, r5, r20, r60, vol20, vol60, resid5])
+        feats.append(day_feat)
+    return np.vstack(feats)
+
+
+def _ridge_rank_signal(prcSoFar):
+    """Tiny in-file ridge model. It is intentionally used as a weak rank
+    overlay, not as the primary forecast engine."""
+    nInst, T = prcSoFar.shape
+    if T < RIDGE_MIN_TRAIN_DAYS + 65:
+        return np.zeros(nInst)
+
+    logp = np.log(np.maximum(prcSoFar, 1e-12))
+    last_train_day = T - 2
+    first_train_day = max(60, last_train_day - RIDGE_MAX_TRAIN_DAYS + 1)
+    day_indices = np.arange(first_train_day, last_train_day + 1)
+    if day_indices.size < RIDGE_MIN_TRAIN_DAYS:
+        return np.zeros(nInst)
+
+    X = _ridge_feature_matrix(logp, day_indices)
+    y = np.concatenate([
+        logp[:, d + 1] - logp[:, d]
+        for d in day_indices
+    ])
+    if X.shape[0] <= X.shape[1] + 2:
+        return np.zeros(nInst)
+
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0) + 1e-9
+    Xs = (X - mu) / sd
+    yc = y - y.mean()
+    xtx = Xs.T @ Xs
+    beta = np.linalg.solve(xtx + RIDGE_ALPHA * np.eye(xtx.shape[0]), Xs.T @ yc)
+
+    x_now = _ridge_feature_matrix(logp, np.array([T - 1]))
+    pred = ((x_now - mu) / sd) @ beta
+    return _rank01_to_score(pred)
+
+
+def _proxy_signal_at(logp, day):
+    """Fast historical proxies for adaptive alpha weighting."""
+    r5 = logp[:, day] - logp[:, day - 5]
+    r20 = logp[:, day] - logp[:, day - 20]
+    r60 = logp[:, day] - logp[:, day - 60]
+    market5 = r5.mean()
+    return (
+        _zscore_cross_section(r20 + 0.5 * r60),
+        _zscore_cross_section(-r5),
+        _zscore_cross_section(-(r5 - market5)),
+    )
+
+
+def _adaptive_alpha_weights(prcSoFar):
+    """Recent cross-sectional IC gate for trend, reversion, residual and ridge."""
+    _, T = prcSoFar.shape
+    if T < ADAPTIVE_IC_MIN_DAYS + 70:
+        return ADAPTIVE_PRIOR / ADAPTIVE_PRIOR.sum()
+
+    logp = np.log(np.maximum(prcSoFar, 1e-12))
+    start = max(60, T - 1 - ADAPTIVE_IC_LOOKBACK)
+    end = T - 2
+    trend_ic, rev_ic, resid_ic = [], [], []
+    for d in range(start, end + 1):
+        fwd = logp[:, d + 1] - logp[:, d]
+        sigs = _proxy_signal_at(logp, d)
+        vals = [trend_ic, rev_ic, resid_ic]
+        for out, sig in zip(vals, sigs):
+            out.append(_safe_corr(sig, fwd))
+
+    if len(trend_ic) < ADAPTIVE_IC_MIN_DAYS:
+        return ADAPTIVE_PRIOR / ADAPTIVE_PRIOR.sum()
+
+    raw = np.array([
+        max(0.0, float(np.nanmean(trend_ic))),
+        max(0.0, float(np.nanmean(rev_ic))),
+        max(0.0, float(np.nanmean(resid_ic))),
+        0.015,
+    ])
+    weights = 0.65 * ADAPTIVE_PRIOR + 0.35 * (raw + 0.01)
+    return weights / max(weights.sum(), 1e-9)
+
+
+def _score_aware_scale(pnl_hist):
+    if len(pnl_hist) < 35:
+        return 1.0
+    window = np.asarray(pnl_hist[-60:], dtype=float)
+    sd = float(window.std())
+    if sd < 1e-9:
+        return 0.75
+    sharpe = float(window.mean() / sd * np.sqrt(252))
+    draw = np.cumsum(window)
+    peak = np.maximum.accumulate(np.concatenate([[0.0], draw]))[1:]
+    max_dd = float(np.max(peak - draw)) if draw.size else 0.0
+
+    if sharpe < -0.5:
+        scale = 0.45
+    elif sharpe < 0.5:
+        scale = 0.70
+    elif sharpe < 1.5:
+        scale = 1.00
+    elif sharpe < 2.5:
+        scale = 1.20
+    else:
+        scale = 1.35
+
+    if max_dd > 4.0 * sd * np.sqrt(max(1, min(60, len(window)))):
+        scale = min(scale, 0.75)
+    return float(np.clip(scale, 0.40, 1.40))
+
+
 def _dollar_limits(nInst):
     limits = np.full(nInst, DEFAULT_DLR_POS_LIMIT, dtype=float)
     if nInst > 0:
@@ -250,6 +460,172 @@ def _historical_cvar(dollar_position, window):
     n_tail = max(1, int(np.ceil(CVAR_ALPHA * simulated_pnl.shape[0])))
     tail = np.sort(simulated_pnl)[:n_tail]
     return float(tail.mean())
+
+
+def _safe_corr(x, y):
+    if x.size < 3 or y.size < 3:
+        return 0.0
+    sx = float(np.std(x))
+    sy = float(np.std(y))
+    if sx < 1e-12 or sy < 1e-12:
+        return 0.0
+    corr = float(np.corrcoef(x, y)[0, 1])
+    return corr if np.isfinite(corr) else 0.0
+
+
+def _build_pair_feature_vectors(prices, vol_halflife=PAIR_DISCOVERY_VOL_HALFLIFE,
+                                ret_lookback=PAIR_DISCOVERY_RET_LOOKBACK):
+    """One feature vector per instrument for pair prefiltering:
+    volatility, recent return, and lag-1 return autocorrelation."""
+    nInst, T = prices.shape
+    if T < 4:
+        return None
+
+    safe_prices = np.maximum(prices, 1e-12)
+    log_ret = np.diff(np.log(safe_prices), axis=1)
+
+    vol = _ewma_vol(log_ret, vol_halflife)
+    lookback = min(ret_lookback, T - 1)
+    recent_ret = safe_prices[:, -1] / safe_prices[:, -lookback - 1] - 1.0
+    autocorr = np.array([
+        _safe_corr(log_ret[i, :-1], log_ret[i, 1:])
+        for i in range(nInst)
+    ])
+
+    features = np.column_stack([vol, recent_ret, autocorr])
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    mu = features.mean(axis=0, keepdims=True)
+    sd = features.std(axis=0, keepdims=True)
+    return (features - mu) / np.maximum(sd, 1e-9)
+
+
+def _engle_granger_adf_tstat(y, x):
+    """Two-step Engle-Granger screen using a zero-lag ADF regression on
+    residuals. More negative t-stat means stronger mean reversion."""
+    if y.size < 20 or x.size < 20 or np.std(x) < 1e-12:
+        return 0.0, np.inf
+
+    beta, alpha = np.polyfit(x, y, 1)
+    resid = y - (beta * x + alpha)
+    lagged = resid[:-1]
+    dresid = np.diff(resid)
+    denom = float(np.sum(lagged ** 2))
+    if denom < 1e-18:
+        return float(beta), np.inf
+
+    rho = float(np.sum(lagged * dresid) / denom)
+    err = dresid - rho * lagged
+    dof = max(1, lagged.size - 1)
+    se = float(np.sqrt(np.sum(err ** 2) / dof) / np.sqrt(denom))
+    if se < 1e-12:
+        return float(beta), np.inf
+    return float(beta), rho / se
+
+
+def _pair_backtest_quality(prices, ia, ib, beta, lookback=PAIR_Z_LOOKBACK):
+    """Backtest one spread with unit gross exposure; returns a quality tuple."""
+    T = prices.shape[1]
+    if T <= lookback + 5:
+        return None
+
+    pa = prices[ia]
+    pb = prices[ib]
+    spread = pa - beta * pb
+    pnl = []
+    active = 0
+    for t in range(lookback, T - 1):
+        hist = spread[t - lookback:t]
+        sd = float(hist.std())
+        if sd < 1e-9:
+            pnl.append(0.0)
+            continue
+        z = (spread[t] - hist.mean()) / sd
+        strength = max(0.0, (abs(z) - PAIR_Z_EXIT) / (PAIR_Z_ENTRY - PAIR_Z_EXIT))
+        strength = min(1.0, strength)
+        if strength <= 0.0:
+            pnl.append(0.0)
+            continue
+        active += 1
+        unit = -np.sign(z) * strength
+        gross = pa[t] + abs(beta) * pb[t]
+        if gross <= 1e-9:
+            pnl.append(0.0)
+            continue
+        shares_a = unit / gross
+        shares_b = -beta * unit / gross
+        pnl.append(shares_a * (pa[t + 1] - pa[t]) + shares_b * (pb[t + 1] - pb[t]))
+
+    pnl = np.asarray(pnl)
+    if active < PAIR_MIN_BACKTEST_TRADES or pnl.std() < 1e-10:
+        return None
+    sharpe = float(pnl.mean() / pnl.std() * np.sqrt(252))
+    equity = np.cumsum(pnl)
+    peak = np.maximum.accumulate(np.concatenate([[0.0], equity]))[1:]
+    max_dd = float(np.max(peak - equity)) if equity.size else 0.0
+    score = sharpe - 0.35 * max_dd / (pnl.std() * np.sqrt(252) + 1e-9)
+    return score, sharpe, active
+
+
+def _find_cointegrated_pairs(prices, top_k_neighbors=PAIR_DISCOVERY_TOP_K,
+                             adf_threshold=PAIR_DISCOVERY_ADF_THRESHOLD,
+                             max_pairs=PAIR_DISCOVERY_MAX_PAIRS):
+    """Discover structurally similar cointegrated pairs from history.
+
+    Feature-space nearest neighbours keep the Engle-Granger screen focused
+    on instruments with similar volatility, return and autocorrelation
+    behaviour, reducing noisy all-pairs data mining.
+    """
+    nInst, T = prices.shape
+    if nInst < 2 or T < PAIR_DISCOVERY_MIN_HISTORY:
+        return None
+
+    features = _build_pair_feature_vectors(prices)
+    if features is None:
+        return None
+
+    dists = np.linalg.norm(features[:, None, :] - features[None, :, :], axis=-1)
+    np.fill_diagonal(dists, np.inf)
+
+    candidates = set()
+    k_neighbors = min(max(1, top_k_neighbors), nInst - 1)
+    for i in range(nInst):
+        for j in np.argsort(dists[i])[:k_neighbors]:
+            candidates.add((min(i, int(j)), max(i, int(j))))
+
+    safe_prices = np.maximum(prices, 1e-12)
+    log_prices = np.log(safe_prices)
+    results = []
+    for ia, ib in candidates:
+        _, adf_stat = _engle_granger_adf_tstat(log_prices[ia], log_prices[ib])
+        if adf_stat < adf_threshold and np.std(safe_prices[ib]) > 1e-12:
+            trade_beta, _ = np.polyfit(safe_prices[ib], safe_prices[ia], 1)
+            if np.isfinite(trade_beta):
+                quality = _pair_backtest_quality(safe_prices, ia, ib, float(trade_beta))
+                if quality is not None:
+                    score, sharpe, active = quality
+                    if score > 0.0 and sharpe > 0.4:
+                        results.append((
+                            ia, ib, float(trade_beta), float(adf_stat),
+                            float(score), float(sharpe), int(active)
+                        ))
+
+    results.sort(key=lambda row: row[4], reverse=True)
+    return [(ia, ib, beta, score, sharpe) for ia, ib, beta, _, score, sharpe, _ in results[:max_pairs]]
+
+
+def _calibrate_pairs(prcSoFar):
+    """Lazy pair discovery using only a held-out-safe training prefix."""
+    if not PAIR_DISCOVERY_ENABLED:
+        return list(DEFAULT_PAIRS)
+    _, T = prcSoFar.shape
+    if T <= PAIR_DISCOVERY_HOLDOUT_DAYS + PAIR_DISCOVERY_MIN_HISTORY:
+        return None
+
+    train_prices = prcSoFar[:, : T - PAIR_DISCOVERY_HOLDOUT_DAYS]
+    discovered = _find_cointegrated_pairs(train_prices)
+    if discovered:
+        return discovered
+    return list(DEFAULT_PAIRS)
 
 
 # ==========================================================================
@@ -453,7 +829,9 @@ _state = {
     "signal_pnl_hist": [],        # smoothed-signal-book PnL, for the de-risker
     "derisked": False,            # hysteretic de-risker state (merged from v1)
     "last_scale": 1.0,            # de-risk scale in force yesterday (for PnL normalisation)
-    "pair_state": [{"dir": 0, "shares_a": 0, "shares_b": 0} for _ in PAIRS],
+    "pairs": list(DEFAULT_PAIRS),
+    "pair_state": [{"dir": 0, "shares_a": 0, "shares_b": 0} for _ in DEFAULT_PAIRS],
+    "pairs_calibrated": False,
     "cum_dvolume": 0.0, "call_count": 0, "churn_sign": 1,
     "params": {                   # live values of the four swept thresholds;
         "KELLY_FRACTION": DEFAULT_KELLY_FRACTION,      # overwritten once
@@ -478,6 +856,17 @@ def getMyPosition(prcSoFar):
             # Uncomment to see what the sweep picked, and on how much data:
             # print(f"[calibration] {result}")
 
+    if not _state["pairs_calibrated"]:
+        pairs = _calibrate_pairs(prcSoFar)
+        if pairs is not None:
+            _state["pairs"] = pairs
+            _state["pair_state"] = [
+                {"dir": 0, "shares_a": 0, "shares_b": 0} for _ in pairs
+            ]
+            _state["pairs_calibrated"] = True
+            # Uncomment to see discovered pair hedge ratios:
+            # print(f"[pair calibration] {_state['pairs']}")
+
     params = _state["params"]
     kelly_fraction = params["KELLY_FRACTION"]
     dd_cap_dollars = params["DD_CAP_DOLLARS"]
@@ -499,7 +888,17 @@ def getMyPosition(prcSoFar):
     # ---- signals, kept SEPARATE so they can be risk-managed asymmetrically
     trend_score = _trend_signal(prcSoFar, vol)
     reversion_score = _reversion_signal(prcSoFar, vol)
-    raw_score = MOM_WEIGHT * trend_score + REV_WEIGHT * reversion_score
+    residual_score = _residual_reversion_signal(prcSoFar, vol)
+    ridge_score = _ridge_rank_signal(prcSoFar)
+    alpha_weights = _adaptive_alpha_weights(prcSoFar)
+
+    trend_component = alpha_weights[0] * _zscore_cross_section(trend_score)
+    reversion_component = (
+        alpha_weights[1] * _zscore_cross_section(reversion_score)
+        + alpha_weights[2] * RESID_WEIGHT * residual_score
+        + alpha_weights[3] * RIDGE_WEIGHT * ridge_score
+    )
+    raw_score = trend_component + reversion_component
 
     trade_mask = np.ones(nInst, dtype=bool)
     if SIGNAL_KEEP_TOP_K is not None and 0 < SIGNAL_KEEP_TOP_K < nInst:
@@ -510,10 +909,10 @@ def getMyPosition(prcSoFar):
     risk_frac[0] *= ALGO_RISK_FRACTION
 
     trend_dollar_full = np.where(
-        trade_mask, np.tanh(MOM_WEIGHT * trend_score / TAU) * dlr_limits * risk_frac, 0.0
+        trade_mask, np.tanh(trend_component / ALPHA_TAU) * dlr_limits * risk_frac, 0.0
     )
     reversion_dollar = np.where(
-        trade_mask, np.tanh(REV_WEIGHT * reversion_score / TAU) * dlr_limits * risk_frac, 0.0
+        trade_mask, np.tanh(reversion_component / ALPHA_TAU) * dlr_limits * risk_frac, 0.0
     )
 
     # ---- continuous rolling-drawdown scale on the TREND book only --------
@@ -590,45 +989,59 @@ def getMyPosition(prcSoFar):
         if _state["derisked"]:
             dollar_position = dollar_position * DERISK_SCALE
 
+    score_scale = _score_aware_scale(_state["signal_pnl_hist"])
+    dollar_position = dollar_position * score_scale
+
     _state["last_scale"] = DERISK_SCALE if _state["derisked"] else 1.0
 
     target_shares = dollar_position / curPrices
 
-    # ---- pairs-trading overlay (unchanged; not drawdown-managed) ---------
+    # ---- pairs-trading book: continuous spread z-score sizing ------------
     pair_pos = np.zeros(nInst)
     if t > PAIR_Z_LOOKBACK:
-        for k, (ia, ib, beta) in enumerate(PAIRS):
+        for spec in _state["pairs"]:
+            ia, ib, beta = spec[:3]
             if max(ia, ib) >= nInst:
                 continue
-            st = _state["pair_state"][k]
             spread = (prcSoFar[ia, -PAIR_Z_LOOKBACK:]
                       - beta * prcSoFar[ib, -PAIR_Z_LOOKBACK:])
             sd = spread.std()
             if sd < 1e-9:
                 continue
             z = (spread[-1] - spread.mean()) / sd
+            strength = max(0.0, (abs(z) - PAIR_Z_EXIT) / (PAIR_Z_ENTRY - PAIR_Z_EXIT))
+            strength = min(1.0, strength)
+            if strength <= 0.0:
+                continue
 
-            if st["dir"] == 0:
-                want = 0
-                if z >= PAIR_Z_ENTRY:
-                    want = -1
-                elif z <= -PAIR_Z_ENTRY:
-                    want = +1
-                if want != 0:
-                    edge = (curPrices[ia] * raw_score[ia]
-                            - beta * curPrices[ib] * raw_score[ib])
-                    if (not PAIR_SIGNAL_GATE) or want * edge >= 0:
-                        sa = int(round(want * PAIR_TRADE_DOLLARS / curPrices[ia]))
-                        st["dir"] = want
-                        st["shares_a"] = sa
-                        st["shares_b"] = int(round(-beta * sa))
-            elif st["dir"] * z >= -PAIR_Z_EXIT:
-                st["dir"] = 0
-                st["shares_a"] = 0
-                st["shares_b"] = 0
+            edge = (curPrices[ia] * raw_score[ia]
+                    - beta * curPrices[ib] * raw_score[ib])
+            want = -np.sign(z)
+            if PAIR_SIGNAL_GATE and want * edge < 0:
+                continue
 
-            pair_pos[ia] += st["shares_a"]
-            pair_pos[ib] += st["shares_b"]
+            quality = float(spec[3]) if len(spec) > 3 else 1.0
+            quality_scale = float(np.clip(0.7 + 0.35 * quality, 0.6, 1.8))
+            gross_per_unit = curPrices[ia] + abs(beta) * curPrices[ib]
+            if gross_per_unit <= 1e-9:
+                continue
+
+            target_gross = PAIR_TRADE_DOLLARS * quality_scale * strength
+            unit = want * target_gross / gross_per_unit
+            pair_pos[ia] += unit
+            pair_pos[ib] += -beta * unit
+
+        pair_gross = float(np.sum(np.abs(pair_pos) * curPrices))
+        if pair_gross > PAIR_MAX_BOOK_DOLLARS:
+            pair_pos *= PAIR_MAX_BOOK_DOLLARS / pair_gross
+
+        if hist_len >= CVAR_MIN_HISTORY and PAIR_TARGET_DAILY_VOL > 0:
+            pair_dollars = pair_pos * curPrices
+            pair_window = full_log_ret[:, -min(hist_len, CVAR_LOOKBACK):]
+            pair_pnl = pair_dollars @ pair_window
+            pair_vol = float(np.std(pair_pnl))
+            if pair_vol > 1e-9:
+                pair_pos *= min(1.0, PAIR_TARGET_DAILY_VOL / pair_vol)
 
     # ---- signal-book smoothing (turnover control) -------------------------
     prev_smoothed = _state.get("_last_smoothed", np.zeros(nInst))
